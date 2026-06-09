@@ -1,0 +1,37 @@
+# dependencies
+node_modules/
+
+# env (contains API keys)
+.env
+.env.*
+!.env.example
+
+# server data (generated designs)
+server-hono/data/
+data/
+client/dist/
+
+# build output
+dist/
+/.next/
+/out/
+server-hono/dist/
+
+# debug artifacts
+sse-*.txt
+test-*.html
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# misc
+*.pem
+*.log
+*.tsbuildinfo
