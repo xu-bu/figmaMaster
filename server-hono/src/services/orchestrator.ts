@@ -1,29 +1,47 @@
 // ============================================================
-// Orchestrator: decompose → worker pool → babel(retry) → buildHTML
+// Orchestrator: decompose → shared components → concurrent map → babel(retry) → buildHTML
 // ============================================================
 
 import { chatJSON, chatQuick, parseLLMJson } from "./deepseek.js";
-import { intentMsgs, decomposeMsgs, pageMsgs, fixMsgs } from "./prompts.js";
+import { intentMsgs, decomposeMsgs, pageMsgs, fixMsgs, componentMsgs } from "./prompts.js";
 import { transpileJSX, validatePage, buildImportMap, buildHTML } from "./babel.js";
 import { insertVersion } from "../store/jsonstore.js";
-import type { GenerateRequest, DecomposeResult, PageGenTask, PageGenResult, GeneratedPage, StreamEvent } from "../types.js";
+import type { GenerateRequest, DecomposeResult, PageGenTask, PageGenResult, GeneratedPage, SharedComponent, StreamEvent } from "../types.js";
 
 const CONCURRENCY = parseInt(process.env.DEEPSEEK_CONCURRENCY || "4", 10);
 const MAX_RETRIES = 2;
 
 type EmitFn = (evt: StreamEvent) => Promise<void> | void;
 
-// ---- Worker Pool ----
-async function workerPool<T>(tasks: T[], worker: (t: T) => Promise<PageGenResult>, c: number): Promise<PageGenResult[]> {
+/** Prepend shared component JSX code to page JSX so components are defined in scope.
+ *  Avoids duplicating if the code already contains them (e.g. during retry).
+ *  Strips import/export from shared code — page's own imports cover React etc. */
+function prependSharedComponents(task: PageGenTask, pageJsx: string): string {
+  if (!task.sharedComponents?.length) return pageJsx;
+  const alreadyHasAll = task.sharedComponents.every(sc =>
+    pageJsx.includes(`function ${sc.spec.name}`) || pageJsx.includes(`const ${sc.spec.name}`)
+  );
+  if (alreadyHasAll) return pageJsx;
+  const header = task.sharedComponents.map(sc => {
+    return sc.jsx
+      .replace(/export\s+default\s+/g, "")
+      .replace(/^import\s+.*?['"].*?['"];?\s*$/gm, "")  // strip import lines — page code already imports React
+      .replace(/^const\s+styles\s*=/m, `const ${sc.spec.name}_styles =`)  // avoid colliding with page's const styles
+      .trim();
+  }).join("\n\n");
+  return header + "\n\n" + pageJsx;
+}
+
+// ---- Concurrent map (I/O-bound concurrency control) ----
+async function mapConcurrent<T>(items: T[], fn: (item: T) => Promise<PageGenResult>, concurrency: number): Promise<PageGenResult[]> {
   const results: PageGenResult[] = [];
-  const queue = [...tasks];
-  async function run() {
-    while (queue.length > 0) {
-      const task = queue.shift()!;
-      try { results.push(await worker(task)); } catch (err: any) { results.push({ page: {} as GeneratedPage, error: err }); }
+  const iterator = items[Symbol.iterator]();
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    for (const item of iterator) {
+      try { results.push(await fn(item)); } catch (err: any) { results.push({ page: {} as GeneratedPage, error: err }); }
     }
-  }
-  await Promise.all(Array.from({ length: Math.min(c, tasks.length) }, run));
+  });
+  await Promise.all(workers);
   return results;
 }
 
@@ -34,7 +52,7 @@ export async function generateStream(req: GenerateRequest, emit: EmitFn) {
 
   // Step 1: Decompose
   await emit({ event: "status", data: { message: "正在分析需求，拆解页面结构..." } });
-  const decompRaw = await chatJSON(decomposeMsgs(req.prompt, req.preferences, req.interactions));
+  const decompRaw = await chatJSON(decomposeMsgs(req.prompt, req.preferences, req.interactions, req.conversationSummary, req.existingPageNames));
   const decomp: DecomposeResult = parseLLMJson(decompRaw);
   if (!decomp.pages?.length) throw new Error("未能识别页面结构");
 
@@ -44,15 +62,35 @@ export async function generateStream(req: GenerateRequest, emit: EmitFn) {
 
   await emit({ event: "decompose", data: { sharedContext: decomp.sharedContext, pages: decomp.pages, pageCount: decomp.pages.length } });
 
-  // Step 2: Build tasks
+  // Step 2: Generate shared components (e.g. nav, footer) — injected into each page task
+  const sharedComponents: SharedComponent[] = [];
+  if (decomp.sharedComponents?.length) {
+    await emit({ event: "status", data: { message: `生成 ${decomp.sharedComponents.length} 个共享组件...` } });
+    for (const spec of decomp.sharedComponents) {
+      await emit({ event: "component_start", data: { name: spec.name } });
+      try {
+        const raw = await chatJSON(componentMsgs(spec, decomp.sharedContext));
+        const parsed = parseLLMJson(raw);
+        const sc: SharedComponent = { spec, jsx: parsed.jsx || "" };
+        sharedComponents.push(sc);
+        await emit({ event: "component_done", data: { name: spec.name, size: sc.jsx.length } });
+      } catch (err: any) {
+        console.warn(`[component] "${spec.name}" generation failed: ${err.message}`);
+        await emit({ event: "status", data: { message: `⚠️ 组件 ${spec.name} 生成失败，跳过` } });
+      }
+    }
+  }
+
+  // Step 3: Build tasks (with shared components injected)
   const tasks: PageGenTask[] = decomp.pages.map(p => ({
-    page: p, sharedContext: decomp.sharedContext, preferences: req.preferences, interactions: req.interactions, dependencies: decomp.dependencies,
+    page: p, sharedContext: decomp.sharedContext, sharedComponents,
+    preferences: req.preferences, interactions: req.interactions, dependencies: decomp.dependencies,
   }));
 
-  // Step 3: Parallel generation with Babel validation + retry
+  // Step 4: Parallel generation with Babel validation + retry
   await emit({ event: "status", data: { message: `并行生成 ${tasks.length} 个页面...` } });
 
-  const results = await workerPool(tasks, async (task) => {
+  const results = await mapConcurrent(tasks, async (task) => {
     const name = task.page.name;
     await emit({ event: "page_start", data: { page: name } });
 
@@ -86,11 +124,11 @@ export async function generateStream(req: GenerateRequest, emit: EmitFn) {
   // Save
   const version = insertVersion({
     title: pages[0].title, description: `${pages.length} pages`, prompt: req.prompt,
-    pages, sharedContext: decomp.sharedContext, dependencies: decomp.dependencies,
-    preferences: req.preferences, interactions: req.interactions,
+    pages, sharedContext: decomp.sharedContext, sharedComponents: sharedComponents.length ? sharedComponents : undefined,
+    dependencies: decomp.dependencies, preferences: req.preferences, interactions: req.interactions,
   });
 
-  const data = { sharedContext: decomp.sharedContext, pages, dependencies: decomp.dependencies, versionId: version.id };
+  const data = { sharedContext: decomp.sharedContext, pages, sharedComponents: sharedComponents.length ? sharedComponents : undefined, dependencies: decomp.dependencies, versionId: version.id };
   await emit({ event: "complete", data });
   return data;
 }
@@ -100,7 +138,7 @@ async function generateOnePage(task: PageGenTask): Promise<GeneratedPage> {
   const parsed = parseLLMJson(raw);
   const page: GeneratedPage = {
     name: task.page.name, route: task.page.route,
-    jsx: parsed.jsx || "", js: "", html: "", title: parsed.title || task.page.name,
+    jsx: prependSharedComponents(task, parsed.jsx || ""), js: "", html: "", title: parsed.title || task.page.name,
     importMap: {}, jsValid: false,
   };
   return validatePage(page);
@@ -111,7 +149,7 @@ async function fixPage(task: PageGenTask, brokenJSX: string, error: string): Pro
   const parsed = parseLLMJson(raw);
   const page: GeneratedPage = {
     name: task.page.name, route: task.page.route,
-    jsx: parsed.jsx || "", js: "", html: "", title: parsed.title || task.page.name,
+    jsx: prependSharedComponents(task, parsed.jsx || ""), js: "", html: "", title: parsed.title || task.page.name,
     importMap: {}, jsValid: false,
   };
   return validatePage(page);

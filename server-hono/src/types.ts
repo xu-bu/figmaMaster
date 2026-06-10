@@ -14,6 +14,8 @@ export interface SharedContext {
 export interface NavItem {
   label: string;
   route: string;
+  /** Page name that navigate() should use (matches PageTask.name) */
+  pageName: string;
 }
 
 export interface PageTask {
@@ -30,6 +32,7 @@ export interface Dependency {
 
 export interface DecomposeResult {
   sharedContext: SharedContext;
+  sharedComponents?: SharedComponentSpec[];
   pages: PageTask[];
   dependencies: Dependency[];
 }
@@ -62,15 +65,24 @@ export interface GenerateRequest {
   prompt: string;
   preferences: DesignPreferences;
   interactions: InteractionPrefs;
+  /** Optional conversation summary — compressed from earlier turns, injected as project context */
+  conversationSummary?: string;
+  /** Names of existing pages — helps LLM decide to add/modify vs replace */
+  existingPageNames?: string[];
 }
 
 export interface RefineRequest {
   prompt: string;
   pageName: string;
-  currentJsx: string;
+  currentJsx?: string;          // empty or omitted = new page generation
   preferences: DesignPreferences;
   interactions: InteractionPrefs;
   sharedContext?: SharedContext;
+  existingPages?: { name: string; route: string }[];  // context for new page
+  /** Optional conversation summary */
+  conversationSummary?: string;
+  /** Fragment mode: only send relevant components to LLM, merge response back */
+  fragmentMode?: boolean;
 }
 
 export interface SummarizeRequest {
@@ -84,11 +96,26 @@ export interface StreamEvent {
   data: unknown;
 }
 
-// ---- Page generation task for worker pool ----
+// ---- Shared Components ----
+
+export interface SharedComponentSpec {
+  name: string;
+  description: string;
+  /** Optional props this component accepts (e.g. ["currentPage", "items"]) */
+  props?: string[];
+}
+
+export interface SharedComponent {
+  spec: SharedComponentSpec;
+  jsx: string;
+}
+
+// ---- Page generation task ----
 
 export interface PageGenTask {
   page: PageTask;
   sharedContext: SharedContext;
+  sharedComponents?: SharedComponent[];
   preferences: DesignPreferences;
   interactions: InteractionPrefs;
   dependencies: Dependency[];
@@ -108,6 +135,7 @@ export interface Version {
   prompt: string;
   pages: GeneratedPage[];
   sharedContext: SharedContext;
+  sharedComponents?: SharedComponent[];
   dependencies: Dependency[];
   preferences: DesignPreferences;
   interactions: InteractionPrefs;

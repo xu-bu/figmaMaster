@@ -6,6 +6,7 @@ import CodePanel from "./components/code/CodePanel";
 import VersionHistory from "./components/code/VersionHistory";
 import { useDesignStore } from "./stores/designStore";
 import { MessageSquare, Code, History } from "lucide-react";
+import { logClick, logRender } from "./utils/debug";
 
 const TABS = [
   { key: "chat", icon: MessageSquare, label: "对话" },
@@ -15,6 +16,7 @@ const TABS = [
 
 export default function App() {
   const { activeTab, setActiveTab } = useDesignStore();
+  logRender("App", { activeTab });
 
   return (
     <div className="h-screen flex flex-col">
@@ -31,7 +33,10 @@ export default function App() {
                 return (
                   <button
                     key={tab.key}
-                    onClick={() => setActiveTab(tab.key)}
+                    onClick={() => {
+                      logClick("tab-bar", tab.key, { from: activeTab });
+                      setActiveTab(tab.key);
+                    }}
                     className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
                       isActive
                         ? "border-primary text-primary"

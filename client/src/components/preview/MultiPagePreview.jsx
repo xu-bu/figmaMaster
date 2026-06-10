@@ -1,10 +1,12 @@
 import { useDesignStore } from "../../stores/designStore";
 import { LayoutGrid, FileCode } from "lucide-react";
 import PreviewFrame from "./PreviewFrame";
+import { logClick, logRender } from "../../utils/debug";
 
 export default function MultiPagePreview() {
   const { currentPages, activePageIndex, sharedContext, setActivePage } =
     useDesignStore();
+  logRender("MultiPagePreview", { pageCount: currentPages?.length, activePageIndex });
 
   if (!currentPages || currentPages.length === 0) {
     return (
@@ -35,7 +37,10 @@ export default function MultiPagePreview() {
         {currentPages.map((page, i) => (
           <button
             key={i}
-            onClick={() => setActivePage(i)}
+            onClick={() => {
+              logClick("page-tab", page.name || `page-${i}`, { index: i, fromIndex: activePageIndex });
+              setActivePage(i);
+            }}
             className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium transition-colors border-b-2 shrink-0 ${
               i === activePageIndex
                 ? "border-primary text-primary"
