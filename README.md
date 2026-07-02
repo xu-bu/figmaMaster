@@ -2,6 +2,68 @@
 
 自然语言 → 多页面应用设计，实时预览。输入"做一个电商应用，包含首页、商品列表、购物车"，一次生成完整可交互的多页面应用。
 
+## UI
+
+![FigmaMaster UI](clip_20260702_200526.png)
+
+## 架构图
+
+```mermaid
+graph TD
+    User["用户"]
+
+    subgraph Frontend["前端 · React 19 / Vite / Tailwind / Zustand"]
+        Chat["ChatPanel / PromptInput"]
+        Store["designStore (Zustand)"]
+        Preview["PreviewFrame\niframe srcdoc"]
+        Code["CodePanel"]
+        Chat --> Store
+        Store --> Preview
+        Store --> Code
+    end
+
+    subgraph Backend["后端 · Node.js / Hono"]
+        Generate["/api/generate  SSE"]
+        Refine["/api/refine"]
+        RefineAll["/api/refine-all"]
+
+        subgraph Orchestrator["Orchestrator"]
+            D["① Decompose\nSharedContext + PageTasks"]
+            S["② 共享组件生成 (串行)"]
+            P["③ 页面并行生成 Promise.all"]
+            D --> S --> P
+        end
+
+        Babel["Babel 编译管线\nJSX → JS → buildHTML()"]
+        JSONStore["versions.json"]
+
+        Generate --> Orchestrator
+        P --> Babel
+        Babel -->|"HTML string"| Generate
+        Generate --> JSONStore
+    end
+
+    subgraph IFrame["iframe 运行时 · postMessage 协议"]
+        Nav["window.navigate()"]
+        Get["window.getGlobalData()"]
+        Upd["window.updateStore()"]
+        GS["parent globalStore (Zustand)"]
+        Nav --> GS
+        Get <--> GS
+        Upd --> GS
+    end
+
+    LLM["DeepSeek API"]
+
+    User -->|"输入需求"| Chat
+    Store -->|"HTTP / SSE"| Generate
+    Store -->|"HTTP"| Refine
+    Store -->|"HTTP"| RefineAll
+    Orchestrator <-->|"Prompt / 补全"| LLM
+    Generate -->|"SSE stream"| Store
+    Preview -->|"渲染"| IFrame
+```
+
 ## 技术决策
 
 ### 并行多页面
@@ -162,34 +224,37 @@ Node.js (Hono)。决策过程：
 
 Node.js · Hono · DeepSeek · Babel · React 19 · Vite · Tailwind · Zustand
 
-## 未来规划
+## 未来规划 & 已探索方向
 
-### 人工严选组件库
+### 多 iframe 预加载
 
-当前方案完全依赖 LLM 实时生成组件代码，缺点是**稳定性不可控**——同一套 aesthetic 参数下，每次生成的组件细节可能有偏差，且无法保证多轮迭代中的一致性。
+最初是单 iframe 方案，页面切换 = 销毁重建 → 500ms+ 白屏。改为所有页面同时存在、仅 toggle `display:none/block`，切换到 <16ms。代价是首次加载时所有 iframe 并行初始化 React，但浏览器缓存 ESM 模块后实际可接受。
 
-下一步计划是构建一套**人工严选的多风格组件库**，从组件级别锁定审美质量：
+**衍生问题**：预加载的 iframe 在隐藏时已 mount 过 React，`getGlobalData()` 返回的是初始空 store。后续 `updateStore` 只更新 parent 端，iframe 内不知道。解决方案是 runtime 里加 `init` 事件 + `storechange` CustomEvent，parent 切换页时推最新 store，组件用 `useEffect` 监听重新取数。
 
-```
-当前：LLM 自由发挥 → 组件随 prompt 波动，风格不稳定
-未来：设计师严选组件 → 多风格 Palette → LLM 拼装 → 一致性好
-```
+### 增量页面添加
 
-核心思路：
+用户说"生成一个商品详情页"时，keyword 检测（`生成一个`/`加一个`/`添加`）路由到 `addPage`，只调用 refine 端点生成新页，不触发全量 decompose。新页 append 到 `currentPages`，老页面不动。
 
-- **多风格 Palette**：每个 Palette 包含一组主题 token（色板、圆角、间距、字体、投影深度等），覆盖「活泼电商」「极简工具」「后台管理」等常见场景
-- **组件模板库**：对 NavBar、Footer、Card、ProductList、TabBar 等高频组件，每个 Palette 提供 2-3 套手写/精调的 React 组件模板
+**遗留问题**：加页后老页面的导航栏不会自动更新（缺少新页入口）。LLM 级解决方案成本太高（需 refine-all），HTML 字符串级别的 patching 不够可靠。方向是共享组件形式——导航栏抽成独立组件注入所有页面，加页时只改组件一次。
 
-优势：
+### 增量页面加后老页面导航栏同步
 
-- **审美确定性**：每个 Palette 由设计师定义，LLM 不参与样式决策
-- **组件复用**：同一 Palette 下所有页面共享 NavBar、Footer，无需 LLM 重复生成
-- **迭代一致性**：多次生成同一 Palette，组件外观完全一致
-- **渐进式覆盖**：优先覆盖 NavBar、TabBar、ProductCard 等高频组件，长尾场景仍可 fallback 到 LLM 生成
+尝试过 `addPage` 后自动 `refineAllPages` 触发导航栏全局更新，但双 SSE 流冲突导致崩溃。改为 `patchNavIntoPages`——纯字符串匹配 `navigate()` 按钮位置并插新 button。问题是各页面导航栏结构不统一，匹配不稳定。根因是 LLM 自由发挥导致每页导航代码结构不同。
 
-### 其他方向
+**结论**：导航栏这类跨页面共享元素不应靠 LLM 各自生成，而应由系统保证——要么预先注入共享组件 JSX，要么用人工模板替换。这也是「组件库」方向的动力。
 
-- **版本差异对比**：两次生成之间的组件级 diff，精确到哪个组件的哪个 token 发生了变化
+### 人工严选组件库（方向）
+
+当前完全依赖 LLM 生成组件代码，跨页一致性靠 prompt 约束 + 共享上下文维持，但多轮迭代中仍不稳定。
+
+下一步计划构建**多风格 Palette + 组件模板库**：
+
+- **多风格 Palette**：每个 Palette 包含主题 token（色板、圆角、间距、字体），覆盖「活泼电商」「极简工具」「后台管理」
+- **组件模板库**：NavBar、Footer、Card、TabBar 等高频组件，每 Palette 2-3 套手写模板
+- **LLM 角色转变**：从"生成一切"变成"拼装组件"，只需选择哪个 Palette + 填充内容数据
+
+优势：审美确定性、组件复用、迭代一致性、渐进覆盖（高频组件模板兜底，长尾 fallback LLM）。
 
 ## 启动
 
